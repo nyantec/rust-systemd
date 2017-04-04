@@ -172,7 +172,6 @@ impl Journal {
 
         let mut journal = Journal { j: ptr::null_mut() };
         sd_try!(ffi::sd_journal_open(&mut journal.j, flags));
-        sd_try!(ffi::sd_journal_seek_head(journal.j));
         Ok(journal)
     }
 
