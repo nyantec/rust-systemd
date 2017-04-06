@@ -10,8 +10,6 @@ use mbox::MString;
 
 pub struct Journal {
     j: *mut ffi::sd_journal,
-    sz: size_t,
-    data: *mut u8,
 }
 
 /// Represents the set of journal files to read.
@@ -68,7 +66,7 @@ impl Journal {
             JournalFiles::All => 0,
         };
 
-        let mut journal = Journal { j: ptr::null_mut() , sz: 0, data: ptr::null_mut()};
+        let mut journal = Journal { j: ptr::null_mut()};
         sd_try!(ffi::sd_journal_open(&mut journal.j, flags));
         Ok(journal)
     }
@@ -76,10 +74,11 @@ impl Journal {
     /// Get and parse the currently journal record from the journal
     pub fn get_next_field(&mut self) -> Result<Option<(&str, &str)>> {
 
-
-        if sd_try!(ffi::sd_journal_enumerate_data(self.j, &self.data, &mut self.sz)) > 0 {
+        let mut sz: size_t = 0;
+        let data: *mut u8 = ptr::null_mut();
+        if sd_try!(ffi::sd_journal_enumerate_data(self.j, &data, &mut sz)) > 0 {
             unsafe {
-                let b = ::std::slice::from_raw_parts_mut(self.data, self.sz as usize);
+                let b = ::std::slice::from_raw_parts_mut(data, sz as usize);
                 let field = ::std::str::from_utf8_unchecked(b);
                 let mut name_value = field.splitn(2, '=');
                 let name = name_value.next().unwrap();
@@ -97,8 +96,6 @@ impl Journal {
     pub fn previous_record(&mut self) ->Result<Option<i32>> {
         let r = sd_try!(ffi::sd_journal_previous(self.j));
         unsafe { ffi::sd_journal_restart_data(self.j) }
-        self.sz = 0;
-        self.data = ptr::null_mut();
         if r == 0{
             Ok(None)
         }else{
