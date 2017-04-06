@@ -1,119 +1,17 @@
 use libc::{c_char, c_int, size_t};
-use log::{self, Log, LogRecord, LogLocation, LogLevel, LogLevelFilter, SetLoggerError};
-use std::{fmt, io, ptr, result};
-use std::collections::BTreeMap;
+use std::{io, ptr};
 use std::ffi::CString;
 use std::io::ErrorKind::InvalidData;
-use std::os::raw::c_void;
-use ffi::array_to_iovecs;
 use ffi::id128::sd_id128_t;
 use ffi::journal as ffi;
 use id128::Id128;
 use super::Result;
-use std::time;
 use mbox::MString;
 
-/// Send preformatted fields to systemd.
-///
-/// This is a relatively low-level operation and probably not suitable unless
-/// you need precise control over which fields are sent to systemd.
-pub fn send(args: &[&str]) -> c_int {
-    let iovecs = array_to_iovecs(args);
-    unsafe { ffi::sd_journal_sendv(iovecs.as_ptr(), iovecs.len() as c_int) }
-}
-
-/// Send a simple message to systemd-journald.
-pub fn print(lvl: u32, s: &str) -> c_int {
-    send(&[&format!("PRIORITY={}", lvl), &format!("MESSAGE={}", s)])
-}
-
-enum SyslogLevel {
-    // Emerg = 0,
-    // Alert = 1,
-    // Crit = 2,
-    Err = 3,
-    Warning = 4,
-    // Notice = 5,
-    Info = 6,
-    Debug = 7,
-}
-
-/// Send a `log::LogRecord` to systemd-journald.
-pub fn log_record(record: &LogRecord) {
-    let lvl = match record.level() {
-        LogLevel::Error => SyslogLevel::Err,
-        LogLevel::Warn => SyslogLevel::Warning,
-        LogLevel::Info => SyslogLevel::Info,
-        LogLevel::Debug |
-        LogLevel::Trace => SyslogLevel::Debug,
-    } as usize;
-    log_target(lvl, record.location(), record.args(), record.target());
-}
-
-/// Record a log entry, with custom priority and location.
-pub fn log(level: usize, loc: &LogLocation, args: &fmt::Arguments) {
-    send(&[&format!("PRIORITY={}", level),
-           &format!("MESSAGE={}", args),
-           &format!("CODE_LINE={}", loc.line()),
-           &format!("CODE_FILE={}", loc.file()),
-           &format!("CODE_FUNCTION={}", loc.module_path())]);
-}
-
-/// Record a log entry, with custom priority, location and target.
-pub fn log_target(level: usize, loc: &LogLocation, args: &fmt::Arguments, target: &str) {
-    send(&[&format!("PRIORITY={}", level),
-           &format!("MESSAGE={}", args),
-           &format!("TARGET={}", target),
-           &format!("CODE_LINE={}", loc.line()),
-           &format!("CODE_FILE={}", loc.file()),
-           &format!("CODE_FUNCTION={}", loc.module_path())]);
-}
-
-/// Logger implementation over systemd-journald.
-pub struct JournalLog;
-impl Log for JournalLog {
-    fn enabled(&self, _metadata: &log::LogMetadata) -> bool {
-        true
-    }
-
-    fn log(&self, record: &LogRecord) {
-        log_record(record);
-    }
-}
-
-impl JournalLog {
-    pub fn init() -> result::Result<(), SetLoggerError> {
-        Self::init_with_level(LogLevelFilter::Info)
-    }
-
-    pub fn init_with_level(level: LogLevelFilter) -> result::Result<(), SetLoggerError> {
-        log::set_logger(|max_log_level| {
-            max_log_level.set(level);
-            Box::new(JournalLog)
-        })
-    }
-}
-
-fn duration_from_usec(usec: u64) -> time::Duration {
-    let secs = usec / 1_000_000;
-    let sub_usec = (usec % 1_000_000) as u32;
-    let sub_nsec = sub_usec * 1000;
-    time::Duration::new(secs, sub_nsec)
-}
-
-fn system_time_from_realtime_usec(usec: u64) -> time::SystemTime {
-    let d = duration_from_usec(usec);
-    time::UNIX_EPOCH + d
-}
-
-// A single log entry from journal.
-pub type JournalRecord = BTreeMap<String, String>;
-
-/// A reader for systemd journal.
-///
-/// Supports read, next, previous, and seek operations.
 pub struct Journal {
     j: *mut ffi::sd_journal,
+    sz: size_t,
+    data: *mut u8,
 }
 
 /// Represents the set of journal files to read.
@@ -170,50 +68,42 @@ impl Journal {
             JournalFiles::All => 0,
         };
 
-        let mut journal = Journal { j: ptr::null_mut() };
+        let mut journal = Journal { j: ptr::null_mut() , sz: 0, data: ptr::null_mut()};
         sd_try!(ffi::sd_journal_open(&mut journal.j, flags));
         Ok(journal)
     }
 
     /// Get and parse the currently journal record from the journal
-    fn get_record(&mut self) -> Result<Option<JournalRecord>> {
-        unsafe { ffi::sd_journal_restart_data(self.j) }
+    pub fn get_next_field(&mut self) -> Result<Option<(&str, &str)>> {
 
-        let mut ret: JournalRecord = BTreeMap::new();
 
-        let mut sz: size_t = 0;
-        let data: *mut u8 = ptr::null_mut();
-        while sd_try!(ffi::sd_journal_enumerate_data(self.j, &data, &mut sz)) > 0 {
+        if sd_try!(ffi::sd_journal_enumerate_data(self.j, &self.data, &mut self.sz)) > 0 {
             unsafe {
-                let b = ::std::slice::from_raw_parts_mut(data, sz as usize);
+                let b = ::std::slice::from_raw_parts_mut(self.data, self.sz as usize);
                 let field = ::std::str::from_utf8_unchecked(b);
                 let mut name_value = field.splitn(2, '=');
                 let name = name_value.next().unwrap();
                 let value = name_value.next().unwrap();
-                ret.insert(From::from(name), From::from(value));
+                Ok(Some((name, value)))
             }
+            
+        }else{
+            Ok(None)
         }
 
-        Ok(Some(ret))
-    }
-
-    /// Read the next record from the journal. Returns `Ok(None)` if there
-    /// are no more records to read.
-    pub fn next_record(&mut self) -> Result<Option<JournalRecord>> {
-        if sd_try!(ffi::sd_journal_next(self.j)) == 0 {
-            return Ok(None);
-        }
-
-        self.get_record()
         
     }
 
-    pub fn previous_record(&mut self) -> Result<Option<JournalRecord>> {
-        if sd_try!(ffi::sd_journal_previous(self.j)) == 0 {
-            return Ok(None);
+    pub fn previous_record(&mut self) ->Result<Option<i32>> {
+        let r = sd_try!(ffi::sd_journal_previous(self.j));
+        unsafe { ffi::sd_journal_restart_data(self.j) }
+        self.sz = 0;
+        self.data = ptr::null_mut();
+        if r == 0{
+            Ok(None)
+        }else{
+            Ok(Some(r))
         }
-        
-        self.get_record()
     }
 
     /// Seek to a specific position in journal. On success, returns a cursor
@@ -260,52 +150,5 @@ impl Journal {
         Ok(cursor.to_string())
     }
 
-    /// Returns timestamp at which current journal is recorded
-    pub fn timestamp(&self) -> Result<time::SystemTime> {
-        let mut timestamp_us: u64 = 0;
-        sd_try!(ffi::sd_journal_get_realtime_usec(self.j, &mut timestamp_us));
-        Ok(system_time_from_realtime_usec(timestamp_us))
-    }
-
-    /// Adds a match by which to filter the entries of the journal.
-    /// If a match is applied, only entries with this field set will be iterated.
-    pub fn match_add<T: Into<Vec<u8>>>(&mut self, key: &str, val: T) -> Result<&mut Journal> {
-        let mut filter = Vec::<u8>::from(key);
-        filter.push('=' as u8);
-        filter.extend(val.into());
-        let data = filter.as_ptr() as *const c_void;
-        let datalen = filter.len() as size_t;
-        sd_try!(ffi::sd_journal_add_match(self.j, data, datalen));
-        Ok(self)
-    }
-
-    /// Inserts a disjunction (i.e. logical OR) in the match list.
-    pub fn match_or(&mut self) -> Result<&mut Journal> {
-        sd_try!(ffi::sd_journal_add_disjunction(self.j));
-        Ok(self)
-    }
-
-    /// Inserts a conjunction (i.e. logical AND) in the match list.
-    pub fn match_and(&mut self) -> Result<&mut Journal> {
-        sd_try!(ffi::sd_journal_add_conjunction(self.j));
-        Ok(self)
-    }
-
-    /// Flushes all matches, disjunction and conjunction terms.
-    /// After this call all filtering is removed and all entries in
-    /// the journal will be iterated again.
-    pub fn match_flush(&mut self) -> Result<&mut Journal> {
-        unsafe { ffi::sd_journal_flush_matches(self.j) };
-        Ok(self)
-    }
-}
-
-impl Drop for Journal {
-    fn drop(&mut self) {
-        if !self.j.is_null() {
-            unsafe {
-                ffi::sd_journal_close(self.j);
-            }
-        }
-    }
+    
 }
